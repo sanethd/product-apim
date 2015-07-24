@@ -23,6 +23,8 @@ import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
 import org.wso2.carbon.apimgt.api.APIManagementException;
 import org.wso2.carbon.apimgt.api.model.API;
 import org.wso2.carbon.apimgt.api.model.APIIdentifier;
@@ -33,6 +35,7 @@ import org.wso2.carbon.apimgt.migration.APIMigrationException;
 import org.wso2.carbon.apimgt.migration.client.internal.ServiceHolder;
 import org.wso2.carbon.apimgt.migration.util.Constants;
 import org.wso2.carbon.apimgt.migration.util.ResourceUtil;
+import org.wso2.carbon.apimgt.migration.util.StatDBUtil;
 import org.wso2.carbon.base.MultitenantConstants;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
 import org.wso2.carbon.governance.api.generic.GenericArtifactManager;
@@ -48,13 +51,13 @@ import org.wso2.carbon.user.core.tenant.TenantManager;
 import org.wso2.carbon.utils.CarbonUtils;
 import org.wso2.carbon.registry.api.RegistryException;
 import org.wso2.carbon.registry.api.Resource;
+import org.wso2.carbon.utils.DBUtils;
+import org.xml.sax.SAXException;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.sql.Connection;
@@ -100,21 +103,21 @@ public class MigrateFrom18to19 implements MigrationClient {
      * @throws SQLException
      */
     @Override
-    public void databaseMigration(String migrateVersion) throws APIMigrationException, SQLException {
+    public void databaseMigration(String migrateVersion) throws SQLException {
         log.info("Database migration for API Manager 1.8.0 started");
         Connection connection = null;
         PreparedStatement preparedStatement = null;
+        BufferedReader bufferedReader = null;
         try {
             connection = APIMgtDBUtil.getConnection();
             String dbType = MigrationDBCreator.getDatabaseType(connection);
             String dbScript = ResourceUtil.pickQueryFromResources(migrateVersion, dbType);
-            BufferedReader bufferedReader;
 
             InputStream is = new FileInputStream(dbScript);
-            bufferedReader = new BufferedReader(new InputStreamReader(is));
+            bufferedReader = new BufferedReader(new InputStreamReader(is, "UTF8"));
             String sqlQuery;
             while ((sqlQuery = bufferedReader.readLine()) != null) {
-                if ("oracle".equals(dbType)) {
+                if (Constants.DB_TYPE_ORACLE.equals(dbType)) {
                     sqlQuery = sqlQuery.replace(";", "");
                 }
                 sqlQuery = sqlQuery.trim();
@@ -137,20 +140,25 @@ public class MigrateFrom18to19 implements MigrationClient {
                     preparedStatement = connection.prepareStatement(sqlQuery.trim());
                     preparedStatement.execute();
                     connection.commit();
-                    preparedStatement.close();
                 }
             }
 
             //To drop the foreign key
             dropFKConstraint(migrateVersion, dbType);
 
+            bufferedReader.close();
+
         } catch (IOException e) {
-            //ResourceUtil.handleException("Error occurred while finding the query. Please check the file path.", e);
+            //Errors logged to let user know the state of the db migration and continue other resource migrations
             log.error("Error occurred while migrating databases", e);
         } catch (Exception e) {
-            //ResourceUtil.handleException("Error occurred while finding the query. Please check the file path.", e);
+            /* MigrationDBCreator extends from org.wso2.carbon.utils.dbcreator.DatabaseCreator and in the super class
+            method getDatabaseType throws generic Exception */
             log.error("Error occurred while migrating databases", e);
         } finally {
+            if (preparedStatement != null) {
+                preparedStatement.close();
+            }
             if (connection != null) {
                 connection.close();
             }
@@ -160,46 +168,63 @@ public class MigrateFrom18to19 implements MigrationClient {
 
     /**
      * This method is used to remove the FK constraint which is unnamed
-     * This finds the name of the constraint and build the query to delete the constaint and execute it
+     * This finds the name of the constraint and build the query to delete the constraint and execute it
      *
      * @param migrateVersion version to be migrated
      * @param dbType         database type of the user
      * @throws SQLException
      * @throws IOException
-     * @throws APIMigrationException
      */
-    public void dropFKConstraint(String migrateVersion, String dbType) throws SQLException, IOException, APIMigrationException {
-        String constraintName = null;
-        Connection connection;
-        String queryToExecute = ResourceUtil.pickQueryFromResources(migrateVersion, Constants.CONSTRAINT).trim();
-        String queryArray[] = queryToExecute.split(Constants.LINE_BREAK);
+    public void dropFKConstraint(String migrateVersion, String dbType) throws SQLException {
+        Connection connection = null;
+        PreparedStatement preparedStatement = null;
+        ResultSet resultSet = null;
+        Statement statement = null;
+        try {
+            String queryToExecute = ResourceUtil.pickQueryFromResources(migrateVersion, Constants.CONSTRAINT).trim();
+            String queryArray[] = queryToExecute.split(Constants.LINE_BREAK);
 
-        connection = APIMgtDBUtil.getConnection();
-        connection.setAutoCommit(false);
-        Statement statement = connection.createStatement();
-        if ("oracle".equals(dbType)) {
-            queryArray[0] = queryArray[0].replace(Constants.DELIMITER, "");
-        }
-        ResultSet resultSet = statement.executeQuery(queryArray[0]);
-        while (resultSet.next()) {
-            constraintName = resultSet.getString("constraint_name");
-        }
+            connection = APIMgtDBUtil.getConnection();
+            connection.setAutoCommit(false);
+            statement = connection.createStatement();
+            if (Constants.DB_TYPE_ORACLE.equals(dbType)) {
+                queryArray[0] = queryArray[0].replace(Constants.DELIMITER, "");
+            }
+            resultSet = statement.executeQuery(queryArray[0]);
+            String constraintName = null;
 
-        if (constraintName != null) {
-            queryToExecute = queryArray[1].replace("<temp_key_name>", constraintName);
-            if ("oracle".equals(dbType)) {
-                queryToExecute = queryToExecute.replace(Constants.DELIMITER, "");
+            while (resultSet.next()) {
+                constraintName = resultSet.getString("constraint_name");
             }
 
-            if (queryToExecute.contains("\\n")) {
-                queryToExecute = queryToExecute.replace("\\n", "");
+            if (constraintName != null) {
+                queryToExecute = queryArray[1].replace("<temp_key_name>", constraintName);
+                if (Constants.DB_TYPE_ORACLE.equals(dbType)) {
+                    queryToExecute = queryToExecute.replace(Constants.DELIMITER, "");
+                }
+
+                if (queryToExecute.contains("\\n")) {
+                    queryToExecute = queryToExecute.replace("\\n", "");
+                }
+                preparedStatement = connection.prepareStatement(queryToExecute);
+                preparedStatement.execute();
+                connection.commit();
             }
-            PreparedStatement preparedStatement = connection.prepareStatement(queryToExecute);
-            preparedStatement.execute();
-            connection.commit();
-            preparedStatement.close();
+        } catch (APIMigrationException e) {
+            //Foriegn key might be already deleted, log the error and let it continue
+            log.error("Error occurred while deleting foreign key", e);
+        } catch (IOException e) {
+            //If user does not add the file migration will continue and migrate the db without deleting
+            // the foriegn key reference
+            log.error("Error occurred while finding the foriegn key deletion query for execution", e);
+        } finally {
+            if (statement != null) {
+                statement.close();
+            }
+
+            APIMgtDBUtil.closeAllConnections(preparedStatement, connection, resultSet);
         }
-        connection.close();
+
     }
 
     /**
@@ -225,8 +250,8 @@ public class MigrateFrom18to19 implements MigrationClient {
     void rxtMigration() throws APIMigrationException {
         log.info("Rxt migration for API Manager 1.9.0 started.");
         boolean isTenantFlowStarted = false;
-        try {
-            for (Tenant tenant : tenantsArray) {
+        for (Tenant tenant : tenantsArray) {
+            try {
                 PrivilegedCarbonContext.startTenantFlow();
                 isTenantFlowStarted = true;
 
@@ -234,9 +259,8 @@ public class MigrateFrom18to19 implements MigrationClient {
                 If you use tenant details instead of super tenant, you will get javax.naming.NameNotFoundException:
                 Name [jdbc/AM_API] is not bound in this Context. Unable to find [jdbc]*/
 
-                PrivilegedCarbonContext.getThreadLocalCarbonContext().
-                        setTenantDomain(MultitenantConstants.SUPER_TENANT_DOMAIN_NAME);
-                PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantId(MultitenantConstants.SUPER_TENANT_ID);
+                PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantDomain(tenant.getDomain(), true);
+                PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantId(tenant.getId(), true);
 
                 String adminName = ServiceHolder.getRealmService().getTenantUserRealm(tenant.getId())
                         .getRealmConfiguration().getAdminUserName();
@@ -253,7 +277,7 @@ public class MigrateFrom18to19 implements MigrationClient {
                     APIIdentifier apiIdentifier = api.getId();
                     String apiVersion = apiIdentifier.getVersion();
 
-                    if(!(api.getContext().endsWith(RegistryConstants.PATH_SEPARATOR + apiVersion))) {
+                    if (!(api.getContext().endsWith(RegistryConstants.PATH_SEPARATOR + apiVersion))) {
                         artifact.setAttribute("overview_context", api.getContext() +
                                 RegistryConstants.PATH_SEPARATOR + apiVersion);
                     }
@@ -267,25 +291,24 @@ public class MigrateFrom18to19 implements MigrationClient {
                 }
 
             }
-            if(isTenantFlowStarted){
-                PrivilegedCarbonContext.endTenantFlow();
-            }
+            //if (isTenantFlowStarted) {
+            //    PrivilegedCarbonContext.endTenantFlow();
+            //}
 
-        } catch (APIManagementException e) {
-            ResourceUtil.handleException("Error occurred while reading API from the artifact ", e);
-        } catch (RegistryException e) {
-            ResourceUtil.handleException("Error occurred while accessing the registry", e);
-        } catch (UserStoreException e) {
-            ResourceUtil.handleException("Error occurred while reading tenant information", e);
-        }
-        finally {
-            if(isTenantFlowStarted){
-                PrivilegedCarbonContext.endTenantFlow();
+            catch (APIManagementException e) {
+                ResourceUtil.handleException("Error occurred while reading API from the artifact ", e);
+            } catch (RegistryException e) {
+                ResourceUtil.handleException("Error occurred while accessing the registry", e);
+            } catch (UserStoreException e) {
+                ResourceUtil.handleException("Error occurred while reading tenant information", e);
+            } finally {
+                if (isTenantFlowStarted) {
+                    PrivilegedCarbonContext.endTenantFlow();
+                }
             }
         }
-        if (log.isDebugEnabled()) {
-            log.debug("Rxt resource migration done for all the tenants");
-        }
+
+        log.info("Rxt resource migration done for all the tenants");
     }
 
 
@@ -306,10 +329,8 @@ public class MigrateFrom18to19 implements MigrationClient {
                 int tenantId = tenant.getId();
                 isTenantFlowStarted = true;
                 PrivilegedCarbonContext.startTenantFlow();
-                PrivilegedCarbonContext.getThreadLocalCarbonContext()
-                        .setTenantDomain(MultitenantConstants.SUPER_TENANT_DOMAIN_NAME, true);
-                PrivilegedCarbonContext.getThreadLocalCarbonContext()
-                        .setTenantId(MultitenantConstants.SUPER_TENANT_ID);
+                PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantDomain(tenant.getDomain(), true);
+                PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantId(tenant.getId(), true);
 
                 String adminName = ServiceHolder.getRealmService().getTenantUserRealm(tenantId)
                         .getRealmConfiguration().getAdminUserName();
@@ -359,8 +380,9 @@ public class MigrateFrom18to19 implements MigrationClient {
     void swaggerResourceMigration() throws APIMigrationException {
         log.info("Swagger migration for API Manager 1.9.0 started.");
         boolean isTenantFlowStarted = false;
-        try {
-            for (Tenant tenant : tenantsArray) {
+
+        for (Tenant tenant : tenantsArray) {
+            try {
                 if (log.isDebugEnabled()) {
                     log.debug("Swagger migration for tenant " + tenant.getDomain() + "[" + tenant.getId() + "]" + " ");
                 }
@@ -378,7 +400,7 @@ public class MigrateFrom18to19 implements MigrationClient {
                 ServiceHolder.getTenantRegLoader().loadTenantRegistry(tenant.getId());
                 Registry registry = ServiceHolder.getRegistryService().
                         getGovernanceUserRegistry(adminName, tenant.getId());
-                GenericArtifactManager manager = new GenericArtifactManager(registry, "api");
+                GenericArtifactManager manager = new GenericArtifactManager(registry, Constants.API);
                 GovernanceUtils.loadGovernanceArtifacts((UserRegistry) registry);
                 GenericArtifact[] artifacts = manager.getAllGenericArtifacts();
 
@@ -421,26 +443,25 @@ public class MigrateFrom18to19 implements MigrationClient {
                     }
                 }
 
-                PrivilegedCarbonContext.endTenantFlow();
+                //PrivilegedCarbonContext.endTenantFlow();
+            } catch (MalformedURLException e) {
+                ResourceUtil.handleException("Error occurred while creating swagger v2.0 document ", e);
+            } catch (APIManagementException e) {
+                ResourceUtil.handleException("Error occurred while reading API from the artifact ", e);
+            } catch (RegistryException e) {
+                ResourceUtil.handleException("Error occurred while accessing the registry", e);
+            } catch (ParseException e) {
+                ResourceUtil.handleException("Error occurred while getting swagger v2.0 document", e);
+            } catch (UserStoreException e) {
+                ResourceUtil.handleException("Error occurred while reading tenant information", e);
+            } finally {
+                if (isTenantFlowStarted) {
+                    PrivilegedCarbonContext.endTenantFlow();
+                }
             }
-        } catch (MalformedURLException e) {
-            ResourceUtil.handleException("Error occurred while creating swagger v2.0 document ", e);
-        } catch (APIManagementException e) {
-            ResourceUtil.handleException("Error occurred while reading API from the artifact ", e);
-        } catch (RegistryException e) {
-            ResourceUtil.handleException("Error occurred while accessing the registry", e);
-        } catch (ParseException e) {
-            ResourceUtil.handleException("Error occurred while getting swagger v2.0 document", e);
-        } catch (UserStoreException e) {
-            ResourceUtil.handleException("Error occurred while reading tenant information", e);
-        }
-        if(isTenantFlowStarted){
-            PrivilegedCarbonContext.endTenantFlow();
         }
 
-        if (log.isDebugEnabled()) {
-            log.debug("Swagger resource migration done for all the tenants");
-        }
+        log.info("Swagger resource migration done for all the tenants.");
 
     }
 
@@ -462,39 +483,46 @@ public class MigrateFrom18to19 implements MigrationClient {
         String swagger12BasePath = null;
 
         Resource swaggerRes = registry.get(swagger12location + APIConstants.API_DOC_1_2_RESOURCE_NAME);
-        JSONObject swagger12doc = (JSONObject) parser.parse(new String((byte[]) swaggerRes.getContent()));
 
-        Map<String, JSONArray> apiDefPaths = new HashMap<String, JSONArray>();
-        Resource swagger12Res = registry.get(swagger12location);
+        try {
+            JSONObject swagger12doc = (JSONObject) parser.parse(new String((byte[]) swaggerRes.getContent(), "UTF8"));
 
-        //get all the resources inside the 1.2 resource location
-        String[] apiDefinitions = (String[]) swagger12Res.getContent();
+            Map<String, JSONArray> apiDefPaths = new HashMap<String, JSONArray>();
+            Resource swagger12Res = registry.get(swagger12location);
 
-        //get each resource in the 1.2 folder except the api-doc resource
-        for (String apiDefinition : apiDefinitions) {
+            //get all the resources inside the 1.2 resource location
+            String[] apiDefinitions = (String[]) swagger12Res.getContent();
 
-            String resourceName = apiDefinition.substring(apiDefinition.lastIndexOf("/"));
-            //skip if api-doc file
-            if (resourceName.equals(APIConstants.API_DOC_1_2_RESOURCE_NAME)) {
-                continue;
+            //get each resource in the 1.2 folder except the api-doc resource
+            for (String apiDefinition : apiDefinitions) {
+
+                String resourceName = apiDefinition.substring(apiDefinition.lastIndexOf("/"));
+                //skip if api-doc file
+                if (resourceName.equals(APIConstants.API_DOC_1_2_RESOURCE_NAME)) {
+                    continue;
+                }
+
+                Resource resource = registry.get(apiDefinition);
+                JSONObject apiDef =
+                        (JSONObject) parser.parse(new String((byte[]) resource.getContent(), "UTF8"));
+                //get the base path. this is same for all api definitions.
+                swagger12BasePath = (String) apiDef.get("basePath");
+                JSONArray apiArray = (JSONArray) apiDef.get("apis");
+                for (Object anApiArray : apiArray) {
+                    JSONObject api = (JSONObject) anApiArray;
+                    String path = (String) api.get("path");
+                    JSONArray operations = (JSONArray) api.get("operations");
+                    //set the operations object inside each api definition and set it in a map against its resource path
+                    apiDefPaths.put(path, operations);
+                }
             }
-
-            Resource resource = registry.get(apiDefinition);
-            JSONObject apiDef =
-                    (JSONObject) parser.parse(new String((byte[]) resource.getContent()));
-            //get the base path. this is same for all api definitions.
-            swagger12BasePath = (String) apiDef.get("basePath");
-            JSONArray apiArray = (JSONArray) apiDef.get("apis");
-            for (Object anApiArray : apiArray) {
-                JSONObject api = (JSONObject) anApiArray;
-                String path = (String) api.get("path");
-                JSONArray operations = (JSONArray) api.get("operations");
-                //set the operations object inside each api definition and set it in a map against its resource path
-                apiDefPaths.put(path, operations);
-            }
+            JSONObject swagger2Doc = generateSwagger2Document(swagger12doc, apiDefPaths, swagger12BasePath);
+            return swagger2Doc.toJSONString();
+        } catch (UnsupportedEncodingException e) {
+            log.error("Error while reading swagger resource", e);
         }
-        JSONObject swagger2Doc = generateSwagger2Document(swagger12doc, apiDefPaths, swagger12BasePath);
-        return swagger2Doc.toJSONString();
+
+        return null;
     }
 
 
@@ -516,29 +544,29 @@ public class MigrateFrom18to19 implements MigrationClient {
         JSONObject swagger20doc = new JSONObject();
 
         //set swagger version
-        swagger20doc.put("swagger", "2.0");
+        swagger20doc.put(Constants.SWAGGER, Constants.SWAGGER_V2);
 
         //set the info object
         JSONObject info = generateInfoObject(swagger12doc);
         //update info object
-        swagger20doc.put("info", info);
+        swagger20doc.put(Constants.SWAGGER_INFO, info);
 
         //set the paths object
         JSONObject pathObj = generatePathsObj(apiDefPaths);
-        swagger20doc.put("paths", pathObj);
+        swagger20doc.put(Constants.SWAGGER_PATHS, pathObj);
 
         URL url = new URL(swagger12BasePath);
-        swagger20doc.put("host", url.getHost());
-        swagger20doc.put("basePath", url.getPath());
+        swagger20doc.put(Constants.SWAGGER_HOST, url.getHost());
+        swagger20doc.put(Constants.SWAGGER_BASE_PATH, url.getPath());
 
         JSONArray schemes = new JSONArray();
         schemes.add(url.getProtocol());
-        swagger20doc.put("schemes", schemes);
+        swagger20doc.put(Constants.SWAGGER_SCHEMES, schemes);
 
         //securityDefinitions
-        if (swagger12doc.containsKey("authorizations")) {
+        if (swagger12doc.containsKey(Constants.SWAGGER_AUTHORIZATIONS)) {
             JSONObject securityDefinitions = generateSecurityDefinitionsObject(swagger12doc);
-            swagger20doc.put("securityDefinitions", securityDefinitions);
+            swagger20doc.put(Constants.SWAGGER_SECURITY_DEFINITIONS, securityDefinitions);
         }
 
         return swagger20doc;
@@ -558,14 +586,14 @@ public class MigrateFrom18to19 implements MigrationClient {
         JSONObject securityDefinitionObject = new JSONObject();
         JSONObject securitySchemeObject = (JSONObject) parser.parse(Constants.DEFAULT_SECURITY_SCHEME);
 
-        JSONObject authorizations = (JSONObject) swagger12doc.get("authorizations");
+        JSONObject authorizations = (JSONObject) swagger12doc.get(Constants.SWAGGER_AUTHORIZATIONS);
         Set authTypes = authorizations.keySet();
 
         for (Object obj : authTypes) {
             JSONObject authObj = (JSONObject) authorizations.get(obj.toString());
-            if (authObj.containsKey("scopes")) {
+            if (authObj.containsKey(Constants.SWAGGER_SCOPES)) {
                 //Put it to custom WSO2 scopes
-                securitySchemeObject.put("x-wso2-scopes", authObj.get("scopes"));
+                securitySchemeObject.put(Constants.SWAGGER_X_WSO2_SCOPES, authObj.get(Constants.SWAGGER_SCOPES));
             }
             securityDefinitionObject.put(obj.toString(), securitySchemeObject);
         }
@@ -591,40 +619,40 @@ public class MigrateFrom18to19 implements MigrationClient {
         String title = (String) infoObj.get("title");
         String version = (String) swagger12doc.get("apiVersion");
 
-        swagger2InfoObj.put("title", title);
-        swagger2InfoObj.put("version", version);
+        swagger2InfoObj.put(Constants.SWAGGER_TITLE, title);
+        swagger2InfoObj.put(Constants.SWAGGER_VER, version);
 
-        if (infoObj.containsKey("description")) {
-            swagger2InfoObj.put("description", infoObj.get("description"));
+        if (infoObj.containsKey(Constants.SWAGGER_DESCRIPTION)) {
+            swagger2InfoObj.put(Constants.SWAGGER_DESCRIPTION, infoObj.get("description"));
         }
-        if (infoObj.containsKey("termsOfServiceUrl")) {
-            swagger2InfoObj.put("termsOfService", infoObj.get("termsOfServiceUrl"));
+        if (infoObj.containsKey(Constants.SWAGGER_TERMS_OF_SERVICE_URL)) {
+            swagger2InfoObj.put(Constants.SWAGGER_TERMS_OF_SERVICE, infoObj.get(Constants.SWAGGER_TERMS_OF_SERVICE_URL));
         }
 
         //contact object
-        if (infoObj.containsKey("contact")) {
+        if (infoObj.containsKey(Constants.SWAGGER_CONTACT)) {
             JSONObject contactsObj = new JSONObject();
-            String contact = (String) infoObj.get("contact");
+            String contact = (String) infoObj.get(Constants.SWAGGER_CONTACT);
             if (contact.contains("http")) {
-                contactsObj.put("url", contact);
+                contactsObj.put(Constants.SWAGGER_URL, contact);
             } else if (contact.contains("@")) {
-                contactsObj.put("email", contact);
+                contactsObj.put(Constants.SWAGGER_EMAIL, contact);
             } else {
-                contactsObj.put("name", contact);
+                contactsObj.put(Constants.SWAGGER_NAME, contact);
             }
-            swagger2InfoObj.put("contact", contactsObj);
+            swagger2InfoObj.put(Constants.SWAGGER_CONTACT, contactsObj);
         }
 
         //licence object
         JSONObject licenseObj = new JSONObject();
-        if (infoObj.containsKey("license")) {
-            licenseObj.put("name", infoObj.get("license"));
+        if (infoObj.containsKey(Constants.SWAGGER_LICENCE)) {
+            licenseObj.put(Constants.SWAGGER_NAME, infoObj.get(Constants.SWAGGER_LICENCE));
         }
-        if (infoObj.containsKey("licenseUrl")) {
-            licenseObj.put("url", infoObj.get("licenseUrl"));
+        if (infoObj.containsKey(Constants.SWAGGER_LICENCE_URL)) {
+            licenseObj.put(Constants.SWAGGER_URL, infoObj.get(Constants.SWAGGER_LICENCE_URL));
         }
         if (!licenseObj.isEmpty()) {
-            swagger2InfoObj.put("license", licenseObj);
+            swagger2InfoObj.put(Constants.SWAGGER_LICENCE, licenseObj);
         }
         return swagger2InfoObj;
     }
@@ -655,13 +683,13 @@ public class MigrateFrom18to19 implements MigrationClient {
                 for (Object swagger2ParamObj : swagger2ParamObjects) {
                     JSONObject oldParam = (JSONObject) swagger2ParamObj;
                     JSONObject paramObj = new JSONObject();
-                    paramObj.put("name", oldParam.get("name"));
-                    paramObj.put("in", oldParam.get("paramType"));
-                    paramObj.put("required", oldParam.get("required"));
-                    if (paramObj.containsKey("description")) {
-                        paramObj.put("description", oldParam.get("description"));
+                    paramObj.put(Constants.SWAGGER_NAME, oldParam.get(Constants.SWAGGER_NAME));
+                    paramObj.put(Constants.SWAGGER_PARAM_TYPE_IN, oldParam.get("paramType"));
+                    paramObj.put(Constants.SWAGGER_REQUIRED_PARAM, oldParam.get(Constants.SWAGGER_REQUIRED_PARAM));
+                    if (paramObj.containsKey(Constants.SWAGGER_DESCRIPTION)) {
+                        paramObj.put(Constants.SWAGGER_DESCRIPTION, oldParam.get(Constants.SWAGGER_DESCRIPTION));
                     } else {
-                        paramObj.put("description", "");
+                        paramObj.put(Constants.SWAGGER_DESCRIPTION, "");
                     }
                     //Skip body parameter of GET and DELETE methods
                     /*if (!("GET".equals(method)) && !("DELETE".equals(method))) {
@@ -675,14 +703,14 @@ public class MigrateFrom18to19 implements MigrationClient {
 
                 //generate the Operation object
                 // (https://github.com/swagger-api/swagger-spec/blob/master/versions/2.0.md#operationObject)
-                swagger2OperationsObj.put("operationId", operationObject.get("nickname"));
+                swagger2OperationsObj.put(Constants.SWAGGER_OPERATION_ID, operationObject.get("nickname"));
                 //setting operation level params
-                swagger2OperationsObj.put("parameters", newParameters);
+                swagger2OperationsObj.put(Constants.SWAGGER_PARAMETERS, newParameters);
                 if (operationObject.containsKey("notes")) {
-                    swagger2OperationsObj.put("description", operationObject.get("notes"));
+                    swagger2OperationsObj.put(Constants.SWAGGER_DESCRIPTION, operationObject.get("notes"));
                 }
-                if (operationObject.containsKey("summary")) {
-                    swagger2OperationsObj.put("summary", operationObject.get("summary"));
+                if (operationObject.containsKey(Constants.SWAGGER_SUMMARY)) {
+                    swagger2OperationsObj.put(Constants.SWAGGER_SUMMARY, operationObject.get(Constants.SWAGGER_SUMMARY));
                 }
 
 
@@ -705,7 +733,7 @@ public class MigrateFrom18to19 implements MigrationClient {
                     //set a default response message since this is required field
                     responseObject = (JSONObject) jsonParser.parse(Constants.DEFAULT_RESPONSE);
                 }
-                swagger2OperationsObj.put("responses", responseObject);
+                swagger2OperationsObj.put(Constants.SWAGGER_RESPONSES, responseObject);
             }
             pathsObj.put(key, pathItemObj);
         }
@@ -771,6 +799,17 @@ public class MigrateFrom18to19 implements MigrationClient {
     }
 
     /**
+     * This method is used to migrate API stats database.
+     * Database schema changes and data modifications as required will  be carried out.
+     *
+     * @throws APIMigrationException
+     */
+    @Override
+    public void statsMigration() throws APIMigrationException {
+        StatDBUtil.updateContext();
+    }
+
+    /**
      * This method is used to migrate all the file system components
      * such as sequences and synapse files
      *
@@ -826,26 +865,40 @@ public class MigrateFrom18to19 implements MigrationClient {
         String tenantRepository = CarbonUtils.getCarbonTenantsDirPath();
         for (Tenant tenant : tenantsArray) {
 
-            String SequenceFilePath;
+            String sequenceFilePath;
             if (tenant.getId() != MultitenantConstants.SUPER_TENANT_ID) {
-                SequenceFilePath = tenantRepository + "/" + tenant.getId() +
+                sequenceFilePath = tenantRepository + "/" + tenant.getId() +
                         "/synapse-configs/default/api";
             } else {
-                SequenceFilePath = repository + "synapse-configs/default/api";
+                sequenceFilePath = repository + "synapse-configs/default/api";
             }
-            File APIFiles = new File(SequenceFilePath);
+            File APIFiles = new File(sequenceFilePath);
             File[] synapseFiles = APIFiles.listFiles();
             for (File synapseFile : synapseFiles) {
-                if (tenant.getId() == MultitenantConstants.SUPER_TENANT_ID) {
-                    if (synapseFile.getName().matches("[\\w+][--][\\w+][__v]")) {
-                        ResourceUtil.updateSynapseAPI(synapseFile, "ENDPOINT");
-                    }
-                } else {
-                    if (synapseFile.getName().matches("[\\w+][-AT-]" + tenant.getDomain() + "[--][\\w+][--v]]")) {
-                        ResourceUtil.updateSynapseAPI(synapseFile, "ENDPOINT");
-                    }
-                }
+                DocumentBuilderFactory docFactory = DocumentBuilderFactory.newInstance();
+                docFactory.setNamespaceAware(true);
 
+                try {
+                    DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
+                    Document doc = docBuilder.parse(synapseFile);
+
+                    doc.getDocumentElement().normalize();
+
+                    Element rootElement = doc.getDocumentElement();
+
+                    if (Constants.SYNAPSE_API_ROOT_ELEMENT.equals(rootElement.getNodeName()) &&
+                            rootElement.hasAttribute(Constants.SYNAPSE_API_ATTRIBUTE_VERSION)) {
+                        ResourceUtil.updateSynapseAPI(doc, synapseFile);
+                    }
+
+
+                } catch (ParserConfigurationException e) {
+                    ResourceUtil.handleException("Parsing exception encountered for " + synapseFile.getAbsolutePath(), e);
+                } catch (SAXException e) {
+                    ResourceUtil.handleException("SAX exception encountered for " + synapseFile.getAbsolutePath(), e);
+                } catch (IOException e) {
+                    ResourceUtil.handleException("IO exception encountered for " + synapseFile.getAbsolutePath(), e);
+                }
             }
         }
     }
